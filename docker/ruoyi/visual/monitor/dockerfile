@@ -1,0 +1,15 @@
+# 基础镜像
+FROM  openjdk:8-jre
+# author
+MAINTAINER xunfang
+
+# 挂载目录
+VOLUME /home/xunfang
+# 创建目录
+RUN mkdir -p /home/xunfang
+# 指定路径
+WORKDIR /home/xunfang
+# 复制jar文件到路径
+COPY ./jar/xunfang-visual-monitor.jar /home/xunfang/xunfang-visual-monitor.jar
+# 启动系统服务
+ENTRYPOINT ["java","-jar","xunfang-visual-monitor.jar"]

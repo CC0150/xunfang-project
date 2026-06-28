@@ -1,0 +1,2 @@
+com.xunfang.common.log.service.AsyncLogService
+com.xunfang.common.log.aspect.LogAspect

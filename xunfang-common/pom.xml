@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>com.xunfang</groupId>
+        <artifactId>xunfang</artifactId>
+        <version>3.6.6</version>
+    </parent>
+    <modelVersion>4.0.0</modelVersion>
+
+    <modules>
+        <module>xunfang-common-log</module>
+        <module>xunfang-common-core</module>
+        <module>xunfang-common-redis</module>
+        <module>xunfang-common-seata</module>
+        <module>xunfang-common-swagger</module>
+        <module>xunfang-common-security</module>
+        <module>xunfang-common-sensitive</module>
+        <module>xunfang-common-datascope</module>
+        <module>xunfang-common-datasource</module>
+    </modules>
+
+    <artifactId>xunfang-common</artifactId>
+    <packaging>pom</packaging>
+
+    <description>
+        xunfang-common通用模块
+    </description>
+
+</project>
