@@ -4,7 +4,11 @@
       "Bash(unzip -p \"实战之供应商-采购订单管理前端开发.docx\" word/document.xml)",
       "Bash(unzip -p \"实战之供应商-采购订单管理后端开发.docx\" word/document.xml)",
       "Bash(mvn compile *)",
-      "Bash(mvn clean *)"
+      "Bash(mvn clean *)",
+      "Bash(bash -c ' *)",
+      "Read(//tmp/**)",
+      "Bash(xxd /tmp/test_cn.json)",
+      "Bash(python -c ' *)"
     ]
   }
 }

@@ -10,5 +10,6 @@ public interface IXfProductFamilyService {
     TableDataInfo selectXfProductFamilyList(XfProductFamily family, HttpServletRequest request) throws Exception;
     AjaxResult insertXfProductFamily(XfProductFamily family) throws Exception;
     AjaxResult updateXfProductFamily(XfProductFamily family) throws Exception;
+    AjaxResult deleteXfProductFamilyById(String id) throws Exception;
     AjaxResult deleteXfProductFamilyByIds(String[] ids) throws Exception;
 }

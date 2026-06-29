@@ -14,6 +14,7 @@ public interface IXfProductService {
     AjaxResult checkOut(XfVersionProduct product) throws Exception;
     AjaxResult checkIn(XfVersionProduct product) throws Exception;
     AjaxResult updateLifecycleStatus(XfVersionProduct product) throws Exception;
+    AjaxResult updateByAdmin(XfVersionProduct product) throws Exception;
     AjaxResult deleteXfProductByMasterIds(String[] masterIds) throws Exception;
     AjaxResult deleteXfProductByMasterId(String masterId) throws Exception;
 }
