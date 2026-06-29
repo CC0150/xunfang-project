@@ -6,26 +6,56 @@ import com.xunfang.common.core.web.page.TableDataInfo;
 import com.xunfang.manufacture.domain.XfVersionPart;
 import com.xunfang.manufacture.service.IXfPartService;
 import com.xunfang.system.tools.DMEUtil;
+import com.xunfang.system.tools.RedisCache1;
 import com.xunfang.system.tools.RequestUtil;
 import com.xunfang.system.tools.TokenAndProject;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.servlet.http.HttpServletRequest;
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 
 @Service
 public class XfPartServiceImpl implements IXfPartService
 {
+    private static final Logger log = LoggerFactory.getLogger(XfPartServiceImpl.class);
     @Autowired
     private DMEUtil dmeUtil;
+    @Autowired
+    private RedisCache1 redisCache;
+
+    /** 本地文件存储根目录（与 xunfang-file 服务共用路径） */
+    @Value("${xunfang.file.upload-dir:D:/xunfang/uploadPath}")
+    private String uploadDir;
+
+    /** Redis Hash key 前缀 */
+    private static final String REDIS_FILE_KEY = "manufacture:part:file";
 
     // ==================== 工具方法 ====================
 
-    /** 从 DME 枚举对象提取 alias 值 */
+    private JSONObject callDmeApi(String url, JSONObject body, String token) throws Exception {
+        String res = RequestUtil.requestsPost(url, body.toString(), token);
+        if (res == null || res.trim().isEmpty()) {
+            throw new RuntimeException("DME接口响应为空，url=" + url);
+        }
+        try {
+            return new JSONObject(res);
+        } catch (org.json.JSONException e) {
+            log.error("DME响应JSON解析失败，url={}, response={}", url, res);
+            throw new RuntimeException("DME接口返回数据格式异常", e);
+        }
+    }
+
     private String pickAlias(Object enumObj, String defaultVal) {
         if (enumObj instanceof JSONObject) {
             JSONObject eo = (JSONObject) enumObj;
@@ -40,14 +70,12 @@ public class XfPartServiceImpl implements IXfPartService
         return defaultVal;
     }
 
-    /** GET 单个 Part 原始数据 */
     private JSONObject getRawPart(String id) throws Exception {
         TokenAndProject tap = dmeUtil.getToken();
         String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPart01_20/get";
         JSONObject p = new JSONObject(); p.put("id", id);
         JSONObject pj = new JSONObject(); pj.put("params", p);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
         JSONArray dataArr = root.optJSONArray("data");
         if (dataArr == null || dataArr.length() == 0) {
             throw new RuntimeException("DME查询失败，id=" + id + "，响应: " + root.toString());
@@ -55,7 +83,6 @@ public class XfPartServiceImpl implements IXfPartService
         return dataArr.getJSONObject(0);
     }
 
-    /** 拍平枚举字段为字符串值 */
     private JSONObject flattenEnums(JSONObject obj) {
         String[] fields = {"status", "partType", "purchaseOrManufacture", "workingState"};
         for (String f : fields) {
@@ -69,9 +96,7 @@ public class XfPartServiceImpl implements IXfPartService
         return obj;
     }
 
-    /** 归一化工作状态：INWORK → CHECKED_OUT */
     private String normalizeWorkingState(JSONObject obj) {
-        // 优先从 workingState alias 获取
         String ws = null;
         JSONObject wsObj = obj.optJSONObject("workingState");
         if (wsObj != null) {
@@ -88,7 +113,6 @@ public class XfPartServiceImpl implements IXfPartService
         return u;
     }
 
-    /** JSONObject → Map<String, Object> */
     private Map<String, Object> jsonObjectToMap(JSONObject obj) {
         Map<String, Object> map = new HashMap<>();
         if (obj == null) return map;
@@ -112,7 +136,6 @@ public class XfPartServiceImpl implements IXfPartService
         return map;
     }
 
-    /** 构建 DME 过滤条件 */
     private void addCond(JSONArray conditions, String name, String value, String operator) {
         try {
             JSONObject c = new JSONObject();
@@ -125,6 +148,90 @@ public class XfPartServiceImpl implements IXfPartService
             conditions.put(c);
         } catch (org.json.JSONException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    // ==================== Redis 文件元数据 ====================
+
+    /** Redis 存储格式：{"fileId":"uuid","fileName":"xxx.pdf"} */
+    private void saveFileMetaToRedis(String instanceId, String fileId, String fileName) {
+        try {
+            JSONObject meta = new JSONObject();
+            meta.put("fileId", fileId);
+            meta.put("fileName", fileName);
+            redisCache.hset(REDIS_FILE_KEY, instanceId, meta.toString());
+            log.debug("文件元数据已存Redis: partId={}, fileId={}, fileName={}", instanceId, fileId, fileName);
+        } catch (org.json.JSONException e) {
+            log.error("保存文件元数据到Redis失败", e);
+        }
+    }
+
+    private JSONObject getFileMetaFromRedis(String instanceId) {
+        Object val = redisCache.hget(REDIS_FILE_KEY, instanceId);
+        if (val != null) {
+            try { return new JSONObject(val.toString()); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    private void deleteFileMetaFromRedis(String instanceId) {
+        redisCache.hdel(REDIS_FILE_KEY, instanceId);
+    }
+
+    // ==================== 本地文件存储 ====================
+
+    private String saveFileLocally(MultipartFile file) throws Exception {
+        Path dir = Paths.get(uploadDir);
+        if (!Files.exists(dir)) Files.createDirectories(dir);
+        String fileId = UUID.randomUUID().toString().replace("-", "");
+        String originalName = file.getOriginalFilename();
+        String ext = "";
+        if (originalName != null && originalName.contains(".")) {
+            ext = originalName.substring(originalName.lastIndexOf('.'));
+        }
+        Path target = dir.resolve(fileId + ext);
+        file.transferTo(target.toFile());
+        log.info("文件已保存到本地: {}", target.toAbsolutePath());
+        return fileId;
+    }
+
+    private void deleteLocalFile(String fileId) {
+        if (fileId == null || fileId.isEmpty()) return;
+        try {
+            Path dir = Paths.get(uploadDir);
+            if (Files.exists(dir)) {
+                File[] files = dir.toFile().listFiles((d, name) -> name.startsWith(fileId));
+                if (files != null) {
+                    for (File f : files) { f.delete(); }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("删除本地文件失败, fileId={}", fileId, e);
+        }
+    }
+
+    /**
+     * 填充单个 Part 行数据的文件信息（从 Redis）
+     */
+    private void fillFileInfo(XfVersionPart row) {
+        String id = row.getId();
+        if (id == null || id.isEmpty()) return;
+        JSONObject meta = getFileMetaFromRedis(id);
+        if (meta != null) {
+            row.setFileId(meta.optString("fileId"));
+            row.setFileName(meta.optString("fileName"));
+            // 构造下载 URL
+            row.setFileDownloadUrl("/manufacture/file/download"
+                    + "?model_name=XfPart01"
+                    + "&instance_id=" + id
+                    + "&file_id=" + row.getFileId()
+                    + "&attribute_name=file");
+            // 提取无扩展名展示名
+            String fn = row.getFileName();
+            if (fn != null && !fn.isEmpty()) {
+                int dot = fn.lastIndexOf('.');
+                row.setFileNameNoExt(dot > 0 ? fn.substring(0, dot) : fn);
+            }
         }
     }
 
@@ -147,25 +254,10 @@ public class XfPartServiceImpl implements IXfPartService
         part.setPartDeclaration(raw.optString("partDeclaration"));
         part.setDisplayVersion(raw.optString("iteration", raw.optString("version", null)));
 
-        // 附件
-        JSONArray extAttrs = raw.optJSONArray("extAttrs");
-        if (extAttrs != null && extAttrs.length() > 0) {
-            List<Map<String, Object>> list = new ArrayList<>();
-            for (int i = 0; i < extAttrs.length(); i++) {
-                JSONObject item = extAttrs.getJSONObject(i);
-                list.add(jsonObjectToMap(item));
-            }
-            part.setExtAttrs(list);
-            part.extractFileName();
-        }
-
-        // masterId
         JSONObject master = raw.optJSONObject("master");
         if (master != null) part.setMasterId(master.optString("id"));
 
-        // 工作状态归一化
         part.setUiWorkingState(normalizeWorkingState(raw));
-
         part.setCreator(raw.optString("creator"));
         part.setModifier(raw.optString("modifier"));
         String ct = raw.optString("createTime", null);
@@ -173,6 +265,9 @@ public class XfPartServiceImpl implements IXfPartService
         if (ct != null && !ct.isEmpty()) {
             try { part.setCreateTime(DMEUtil.dmeDateToExamDate(ct)); } catch (Exception ignored) {}
         }
+
+        // 从 Redis 填充文件信息
+        fillFileInfo(part);
         return part;
     }
 
@@ -195,11 +290,8 @@ public class XfPartServiceImpl implements IXfPartService
         params.put("publicData", "INCLUDE_PUBLIC_DATA");
         params.put("sorts", new JSONArray());
 
-        // 过滤条件
         JSONObject filter = new JSONObject();
         JSONArray conditions = new JSONArray();
-
-        // 固定 latest=true
         addCond(conditions, "latest", "true", "=");
 
         if (xfPart.getPartName() != null && !xfPart.getPartName().isEmpty())
@@ -221,8 +313,7 @@ public class XfPartServiceImpl implements IXfPartService
         paramsJson.put("params", params);
 
         TokenAndProject tap = dmeUtil.getToken();
-        String res = RequestUtil.requestsPost(url, paramsJson.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, paramsJson, tap.getToken());
         if (!"SUCCESS".equalsIgnoreCase(root.optString("result", "")))
             throw new RuntimeException("Query failed: " + root.toString());
 
@@ -244,32 +335,20 @@ public class XfPartServiceImpl implements IXfPartService
                 row.setStatus(pickAlias(item.opt("status"), ""));
                 row.setPurchaseOrManufacture(pickAlias(item.opt("purchaseOrManufacture"), ""));
                 row.setPartDeclaration(item.optString("partDeclaration"));
-                // 版本号：DME 返回 iteration 字段
                 row.setDisplayVersion(item.optString("iteration", item.optString("version", null)));
-                // 创建时间：DME 返回 UTC 字符串，转 Date
                 String ct = item.optString("createTime", null);
                 if (ct == null || ct.isEmpty()) ct = item.optString("lastUpdateTime", null);
                 if (ct != null && !ct.isEmpty()) {
                     try { row.setCreateTime(DMEUtil.dmeDateToExamDate(ct)); } catch (Exception ignored) {}
                 }
 
-                // masterId
                 JSONObject master = item.optJSONObject("master");
                 if (master != null) row.setMasterId(master.optString("id"));
 
-                // 工作状态归一化
                 row.setUiWorkingState(normalizeWorkingState(item));
 
-                // 附件信息
-                JSONArray extAttrs = item.optJSONArray("extAttrs");
-                if (extAttrs != null && extAttrs.length() > 0) {
-                    List<Map<String, Object>> list = new ArrayList<>();
-                    for (int j = 0; j < extAttrs.length(); j++) {
-                        list.add(jsonObjectToMap(extAttrs.getJSONObject(j)));
-                    }
-                    row.setExtAttrs(list);
-                    row.extractFileName();
-                }
+                // 从 Redis 填充文件信息
+                fillFileInfo(row);
 
                 rows.add(row);
             }
@@ -289,17 +368,24 @@ public class XfPartServiceImpl implements IXfPartService
         return tab;
     }
 
-    // ==================== 新增（可选文件上传） ====================
+    // ==================== 新增 ====================
 
     @Override
     public AjaxResult insertXfPart(XfVersionPart xfPart, MultipartFile file) throws Exception {
         xfPart.setCreateTime(DateUtils.getNowDate());
         TokenAndProject tap = dmeUtil.getToken();
 
-        // 如果有文件，先上传到 iDME 获取 fileId
+        // 如果有文件，保存到本地
         String fileId = null;
+        String fileName = null;
         if (file != null && !file.isEmpty()) {
-            fileId = uploadFileToIDME(file, tap.getToken());
+            try {
+                fileId = saveFileLocally(file);
+                fileName = file.getOriginalFilename();
+            } catch (Exception e) {
+                log.error("保存文件到本地失败", e);
+                return AjaxResult.error("文件保存失败: " + e.getMessage());
+            }
         }
 
         String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPart01_20/create";
@@ -316,42 +402,50 @@ public class XfPartServiceImpl implements IXfPartService
         params.put("master", new JSONObject());
         params.put("branch", new JSONObject());
 
-        // 附件扩展属性
-        if (fileId != null) {
-            JSONArray extAttrs = new JSONArray();
-            JSONObject fileAttr = new JSONObject();
-            fileAttr.put("name", "File_20");
-            JSONObject fileValue = new JSONObject();
-            fileValue.put("id", fileId);
-            fileValue.put("fileName", file.getOriginalFilename());
-            fileAttr.put("value", fileValue);
-            extAttrs.put(fileAttr);
-            params.put("extAttrs", extAttrs);
-        }
-
         JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equals(root.optString("result", ""))) {
+            // DME 创建成功后，获取 instanceId 并保存文件元数据到 Redis
+            JSONArray dataArr = root.optJSONArray("data");
+            if (fileId != null && dataArr != null && dataArr.length() > 0) {
+                String instanceId = dataArr.getJSONObject(0).optString("id");
+                saveFileMetaToRedis(instanceId, fileId, fileName);
+            }
             return AjaxResult.success();
         }
-        return AjaxResult.error(root.optString("error_msg", res));
+        if (fileId != null) deleteLocalFile(fileId);
+        return AjaxResult.error(root.optString("error_msg", "创建Part失败"));
     }
 
-    // ==================== 修改（附件三态） ====================
+    // ==================== 修改 ====================
 
     @Override
     public AjaxResult updateXfPart(XfVersionPart xfPart, MultipartFile file) throws Exception {
         xfPart.setUpdateTime(DateUtils.getNowDate());
         TokenAndProject tap = dmeUtil.getToken();
 
-        // 获取现有数据保留 master/branch 引用
         JSONObject existing = getRawPart(xfPart.getId());
 
-        // 如有新文件，先上传
-        String fileId = null;
+        // 处理附件
+        String newFileId = null;
+        String newFileName = null;
+        boolean wantClear = Boolean.TRUE.equals(xfPart.getClearFile());
+
+        // 获取旧文件信息
+        String oldFileIdToDelete = null;
+        JSONObject oldMeta = getFileMetaFromRedis(xfPart.getId());
+        if (oldMeta != null) {
+            oldFileIdToDelete = oldMeta.optString("fileId", null);
+        }
+
         if (file != null && !file.isEmpty()) {
-            fileId = uploadFileToIDME(file, tap.getToken());
+            try {
+                newFileId = saveFileLocally(file);
+                newFileName = file.getOriginalFilename();
+            } catch (Exception e) {
+                log.error("保存文件到本地失败", e);
+                return AjaxResult.error("文件保存失败: " + e.getMessage());
+            }
         }
 
         String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPart01_20/update";
@@ -367,45 +461,27 @@ public class XfPartServiceImpl implements IXfPartService
         params.put("partDeclaration", xfPart.getPartDeclaration() != null ? xfPart.getPartDeclaration() : existing.optString("partDeclaration"));
         params.put("updateTime", DMEUtil.dateToUTCString(xfPart.getUpdateTime()));
         params.put("modifier", existing.optString("modifier", existing.optString("creator", "gzlg020")));
-
-        // 保留 master/branch 引用
         params.put("master", existing.optJSONObject("master") != null ? existing.getJSONObject("master") : new JSONObject());
         params.put("branch", existing.optJSONObject("branch") != null ? existing.getJSONObject("branch") : new JSONObject());
 
-        // 附件三态处理
-        boolean wantClear = Boolean.TRUE.equals(xfPart.getClearFile());
-        if (fileId != null) {
-            // A. 替换：新文件
-            JSONArray extAttrs = new JSONArray();
-            JSONObject fa = new JSONObject();
-            fa.put("name", "File_20");
-            JSONObject fv = new JSONObject();
-            fv.put("id", fileId);
-            fv.put("fileName", file.getOriginalFilename());
-            fa.put("value", fv);
-            extAttrs.put(fa);
-            params.put("extAttrs", extAttrs);
-        } else if (wantClear) {
-            // B. 删除：value 空数组
-            JSONArray extAttrs = new JSONArray();
-            JSONObject fa = new JSONObject();
-            fa.put("name", "File_20");
-            fa.put("value", new JSONObject());
-            extAttrs.put(fa);
-            params.put("extAttrs", extAttrs);
-        }
-        // C. 保持：不传 extAttrs
-
         JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equals(root.optString("result", ""))) {
+            // 更新 Redis 文件元数据
+            if (newFileId != null) {
+                saveFileMetaToRedis(xfPart.getId(), newFileId, newFileName);
+                if (oldFileIdToDelete != null) deleteLocalFile(oldFileIdToDelete);
+            } else if (wantClear) {
+                deleteFileMetaFromRedis(xfPart.getId());
+                if (oldFileIdToDelete != null) deleteLocalFile(oldFileIdToDelete);
+            }
             return AjaxResult.success();
         }
-        return AjaxResult.error(root.optString("error_msg", res));
+        if (newFileId != null) deleteLocalFile(newFileId);
+        return AjaxResult.error(root.optString("error_msg", "修改Part失败"));
     }
 
-    // ==================== 检出 ====================
+    // ==================== 检出/检入 ====================
 
     @Override
     public AjaxResult checkOut(XfVersionPart xfVersionPart) throws Exception {
@@ -417,15 +493,12 @@ public class XfPartServiceImpl implements IXfPartService
                 ? xfVersionPart.getWorkCopyType() : "BOTH");
         params.put("modifier", "gzlg020");
         JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equalsIgnoreCase(root.optString("result", ""))) {
             return AjaxResult.success();
         }
-        return AjaxResult.error(root.optString("error_msg", res));
+        return AjaxResult.error(root.optString("error_msg", "检出失败"));
     }
-
-    // ==================== 检入 ====================
 
     @Override
     public AjaxResult checkIn(XfVersionPart xfVersionPart) throws Exception {
@@ -435,18 +508,20 @@ public class XfPartServiceImpl implements IXfPartService
         params.put("masterId", xfVersionPart.getMasterId());
         params.put("modifier", "gzlg020");
         JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equalsIgnoreCase(root.optString("result", ""))) {
             return AjaxResult.success();
         }
-        return AjaxResult.error(root.optString("error_msg", res));
+        return AjaxResult.error(root.optString("error_msg", "检入失败"));
     }
 
-    // ==================== 批量删除（按 masterId） ====================
+    // ==================== 删除 ====================
 
     @Override
     public AjaxResult deleteXfPartByMasterIds(String[] masterIds) throws Exception {
+        for (String masterId : masterIds) {
+            try { cleanupPartFileByMasterId(masterId); } catch (Exception ignored) {}
+        }
         TokenAndProject tap = dmeUtil.getToken();
         String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPart01_20/batchDelete";
         JSONObject params = new JSONObject();
@@ -454,81 +529,64 @@ public class XfPartServiceImpl implements IXfPartService
         for (String id : masterIds) idsArr.put(id);
         params.put("masterIds", idsArr);
         JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equalsIgnoreCase(root.optString("result", ""))) {
             return AjaxResult.success();
         }
-        return AjaxResult.error(root.optString("error_msg", res));
+        return AjaxResult.error(root.optString("error_msg", "批量删除失败"));
     }
-
-    // ==================== 单个删除（按 masterId） ====================
 
     @Override
     public AjaxResult deleteXfPartByMasterId(String masterId) throws Exception {
+        try { cleanupPartFileByMasterId(masterId); } catch (Exception ignored) {}
         TokenAndProject tap = dmeUtil.getToken();
         String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPart01_20/delete";
         JSONObject params = new JSONObject();
         params.put("masterId", masterId);
         JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        JSONObject root = new JSONObject(res);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equalsIgnoreCase(root.optString("result", ""))) {
             return AjaxResult.success();
         }
-        return AjaxResult.error(root.optString("error_msg", res));
+        return AjaxResult.error(root.optString("error_msg", "删除失败"));
     }
 
-    // ==================== 文件上传到 iDME ====================
+    /**
+     * 删除 Part 时清理关联的本地文件和 Redis 元数据
+     */
+    private void cleanupPartFileByMasterId(String masterId) throws Exception {
+        TokenAndProject tap = dmeUtil.getToken();
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPart01_20/find/1/1";
+        JSONObject params = new JSONObject();
+        params.put("characterSet", "UTF8");
+        params.put("decrypt", false);
+        params.put("isPresentAll", true);
+        params.put("isNeedTotal", false);
+        params.put("publicData", "INCLUDE_PUBLIC_DATA");
+        params.put("sorts", new JSONArray());
+        JSONObject filter = new JSONObject();
+        JSONArray conditions = new JSONArray();
+        addCond(conditions, "master.id", masterId, "=");
+        addCond(conditions, "latest", "true", "=");
+        filter.put("conditions", conditions);
+        filter.put("ignoreStr", false);
+        filter.put("joiner", "and");
+        filter.put("multi", false);
+        params.put("filter", filter);
 
-    private String uploadFileToIDME(MultipartFile file, String token) throws Exception {
-        // 调用 iDME 文件上传接口
-        String uploadUrl = DMEUtil.projectUrl.replace("/services", "") + "/api/v2/file/uploadFile";
-        // 简化实现：构建 multipart 上传
-        java.io.File tmp = java.io.File.createTempFile("xf_upload_", "_" + file.getOriginalFilename());
-        try {
-            file.transferTo(tmp);
-            String boundary = "----XFUpload" + System.currentTimeMillis();
-            StringBuilder body = new StringBuilder();
-            body.append("--").append(boundary).append("\r\n");
-            body.append("Content-Disposition: form-data; name=\"file\"; filename=\"")
-                    .append(file.getOriginalFilename()).append("\"\r\n");
-            body.append("Content-Type: application/octet-stream\r\n\r\n");
-
-            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-            bos.write(body.toString().getBytes("UTF-8"));
-            java.io.FileInputStream fis = new java.io.FileInputStream(tmp);
-            byte[] buf = new byte[8192]; int n;
-            while ((n = fis.read(buf)) != -1) bos.write(buf, 0, n);
-            fis.close();
-            bos.write(("\r\n--" + boundary + "--\r\n").getBytes("UTF-8"));
-
-            java.net.URL u = new java.net.URL(uploadUrl);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
-            conn.setRequestProperty("X-Auth-Token", token);
-            conn.getOutputStream().write(bos.toByteArray());
-            conn.getOutputStream().flush();
-
-            java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
-            StringBuilder resp = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) resp.append(line);
-            reader.close();
-
-            JSONObject uploadRes = new JSONObject(resp.toString());
-            if ("SUCCESS".equalsIgnoreCase(uploadRes.optString("result", ""))) {
-                JSONArray dataArr = uploadRes.optJSONArray("data");
-                if (dataArr != null && dataArr.length() > 0) {
-                    return dataArr.getJSONObject(0).optString("id", "");
+        JSONObject pj = new JSONObject(); pj.put("params", params);
+        JSONObject root = callDmeApi(url, pj, tap.getToken());
+        if ("SUCCESS".equalsIgnoreCase(root.optString("result", ""))) {
+            JSONArray dataArr = root.optJSONArray("data");
+            if (dataArr != null && dataArr.length() > 0) {
+                String instanceId = dataArr.getJSONObject(0).optString("id");
+                JSONObject meta = getFileMetaFromRedis(instanceId);
+                if (meta != null) {
+                    String oldFileId = meta.optString("fileId", null);
+                    if (oldFileId != null && !oldFileId.isEmpty()) deleteLocalFile(oldFileId);
+                    deleteFileMetaFromRedis(instanceId);
                 }
             }
-            throw new RuntimeException("文件上传失败: " + resp);
-        } finally {
-            tmp.delete();
         }
     }
 }

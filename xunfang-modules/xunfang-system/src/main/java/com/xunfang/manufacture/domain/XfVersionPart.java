@@ -74,28 +74,55 @@ public class XfVersionPart extends XfPart
 
     /**
      * 从 extAttrs 提取第一个附件的文件名和下载地址
+     * <p>支持 DME 返回的数组格式 [{...}] 和单对象格式 {...}
+     * <p>fileDownloadUrl 构造为：/manufacture/file/download?model_name=XfPart01&amp;instance_id={id}&amp;file_id={fileId}&amp;attribute_name=file
      */
     public void extractFileName() {
         if (extAttrs == null || extAttrs.isEmpty()) return;
         Map<String, Object> first = extAttrs.get(0);
         if (first == null) return;
         Object valObj = first.get("value");
+        Map<String, Object> fileObj = null;
+
         if (valObj instanceof List) {
+            // DME 返回数组格式：[{id, fileName, fileDownloadUrl, ...}]
             List<?> list = (List<?>) valObj;
             if (!list.isEmpty() && list.get(0) instanceof Map) {
                 @SuppressWarnings("unchecked")
-                Map<String, Object> fileObj = (Map<String, Object>) list.get(0);
-                if (fileObj.containsKey("fileName")) {
-                    this.fileName = String.valueOf(fileObj.get("fileName"));
-                }
-                if (fileObj.containsKey("id")) {
-                    this.fileId = String.valueOf(fileObj.get("id"));
-                }
+                Map<String, Object> m = (Map<String, Object>) list.get(0);
+                fileObj = m;
+            }
+        } else if (valObj instanceof Map) {
+            // 单对象格式（创建/更新时的格式）
+            @SuppressWarnings("unchecked")
+            Map<String, Object> m = (Map<String, Object>) valObj;
+            fileObj = m;
+        }
+
+        if (fileObj != null) {
+            if (fileObj.containsKey("fileName")) {
+                this.fileName = String.valueOf(fileObj.get("fileName"));
+            }
+            if (fileObj.containsKey("id")) {
+                this.fileId = String.valueOf(fileObj.get("id"));
+            }
+            // 构造 PDF 规范的本地文件下载地址
+            String versionId = getId();
+            if (this.fileId != null && !this.fileId.isEmpty()
+                    && versionId != null && !versionId.isEmpty()) {
+                this.fileDownloadUrl = "/manufacture/file/download"
+                        + "?model_name=XfPart01"
+                        + "&instance_id=" + versionId
+                        + "&file_id=" + this.fileId
+                        + "&attribute_name=file";
+            } else {
+                // 如果有 DME fileDownloadUrl 但没有我们构造的条件，回退使用 DME 直链
                 if (fileObj.containsKey("fileDownloadUrl")) {
                     this.fileDownloadUrl = String.valueOf(fileObj.get("fileDownloadUrl"));
                 }
             }
         }
+
         // 提取无扩展名展示名
         if (fileName != null && !fileName.isEmpty()) {
             int dot = fileName.lastIndexOf('.');
