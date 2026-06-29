@@ -1,19 +1,20 @@
 package com.xunfang.system;
 
 import com.xunfang.common.security.annotation.EnableRyFeignClients;
-import org.mybatis.spring.boot.autoconfigure.MybatisAutoConfiguration;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.ComponentScan;
 import com.xunfang.common.security.annotation.EnableCustomConfig;
 
 /**
  * 系统模块
- * 
+ *
  * @author xunfang
  */
 @EnableCustomConfig
 @EnableRyFeignClients
 @SpringBootApplication
+@ComponentScan(basePackages = {"com.xunfang.system", "com.xunfang.manufacture"})
 public class XunFangSystemApplication
 {
     public static void main(String[] args)

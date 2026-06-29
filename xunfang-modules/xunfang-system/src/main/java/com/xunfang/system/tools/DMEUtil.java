@@ -30,11 +30,11 @@ public class DMEUtil {
     @Autowired
     RedisCache1 redisCache1;
 
-    private static final String userName = "comp10100";//用户名
-    private static final String password = "indus@10000";//密码
-    private static final String account = "SZIIT2024";//账户名
+    private static final String userName = "gzlg020";//用户名
+    private static final String password = "Hngy@123456";//密码
+    private static final String account = "sziit2024";//账户名
     private static final String hwyProjectName = "cn-north-4";//区域名
-    public static final String projectUrl = "http://642f01d8-ca51-4a28-9000-904a4f1e5072.xdm.runtime.cn-north-4.huaweicloud-idme.com/rdm_533076e00e56414ab11171feb2ffd512_app/services";//url前缀
+    public static final String projectUrl = "http://7ecd0cfa-83e9-493a-b9a1-c0e4d5e80fb4.xdm.runtime.cn-north-4.huaweicloud-idme.com/rdm_5eb684ad0fcc42e0b16ff67259692e7d_app/services";//url前缀
 
     public static final String apiCustomService = "/rdm/basic/api/customservice/";//高代码编码前缀
     public static final String tenantApiService = "/rdm/common/api/Tenant/";//租户API前缀
