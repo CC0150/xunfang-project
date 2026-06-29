@@ -124,10 +124,14 @@ public class XfProductServiceImpl implements IXfProductService
 
     /** 保存产品元数据到Redis（productFamily、lifecycleStateName等FIND不返回的字段） */
     private void saveMetaToRedis(String instanceId, String productFamily, String lifecycleStateName) {
+        saveMetaToRedis(instanceId, productFamily, lifecycleStateName, null);
+    }
+    private void saveMetaToRedis(String instanceId, String productFamily, String lifecycleStateName, String createTimeStr) {
         try {
             JSONObject meta = new JSONObject();
             if (productFamily != null) meta.put("productFamily", productFamily);
             if (lifecycleStateName != null) meta.put("lifecycleStateName", lifecycleStateName);
+            if (createTimeStr != null) meta.put("createTime", createTimeStr);
             redisCache.hset(REDIS_META_KEY, instanceId, meta.toString());
         } catch (Exception e) { log.error("保存产品元数据到Redis失败", e); }
     }
@@ -174,6 +178,7 @@ public class XfProductServiceImpl implements IXfProductService
     /** 自动从 GET API 获取元数据并缓存到 Redis（用于弥补 FIND 不返回的字段） */
     private void autoFillMetaFromGet(XfVersionProduct p) {
         try {
+            System.err.println("[CT-DEBUG] autoFillMetaFromGet called for id=" + p.getId() + ", current createTime=" + p.getCreateTime());
             JSONObject raw = getRaw(p.getId());
             String family = raw.optString("productFamily", null);
             String lcName = null;
@@ -182,13 +187,21 @@ public class XfProductServiceImpl implements IXfProductService
                 lcName = lcState.optString("name", null);
                 if (lcName == null || lcName.isEmpty()) lcName = lcState.optString("nameEn", null);
             }
+            // 获取原始创建时间
+            JSONObject master = raw.optJSONObject("master");
+            String ctStr = null;
+            if (master != null) ctStr = master.optString("createTime", raw.optString("createTime", null));
+            System.err.println("[CT-DEBUG] id=" + p.getId() + ", raw.ct=" + raw.optString("createTime","null") + ", master=" + (master!=null) + ", ctStr=" + ctStr);
             if (family != null && !family.isEmpty()) {
                 p.setProductFamily(family);
-                saveMetaToRedis(p.getId(), family, lcName);
             }
             if (lcName != null && !lcName.isEmpty()) {
                 p.setLifecycleStateName(lcName);
             }
+            if (ctStr != null && !ctStr.isEmpty()) {
+                try { p.setCreateTime(DMEUtil.dmeDateToExamDate(ctStr)); } catch (Exception ignored) {}
+            }
+            saveMetaToRedis(p.getId(), family, lcName, ctStr);
         } catch (Exception e) {
             log.warn("autoFillMeta failed for id={}: {}", p.getId(), e.getMessage());
         }
@@ -216,7 +229,7 @@ public class XfProductServiceImpl implements IXfProductService
             }
         }
 
-        // 元数据（FIND不返回的字段：productFamily、lifecycleStateName）
+        // 元数据（FIND不返回的字段：productFamily、lifecycleStateName、createTime）
         JSONObject meta = getMetaFromRedis(id);
         if (meta != null) {
             if (p.getProductFamily() == null || p.getProductFamily().isEmpty()) {
@@ -224,6 +237,10 @@ public class XfProductServiceImpl implements IXfProductService
             }
             if (p.getLifecycleStateName() == null || p.getLifecycleStateName().isEmpty()) {
                 p.setLifecycleStateName(meta.optString("lifecycleStateName", null));
+            }
+            String cachedCt = meta.optString("createTime", null);
+            if (cachedCt != null && !cachedCt.isEmpty() && p.getCreateTime() == null) {
+                try { p.setCreateTime(DMEUtil.dmeDateToExamDate(cachedCt)); } catch (Exception ignored) {}
             }
         }
     }
@@ -235,9 +252,9 @@ public class XfProductServiceImpl implements IXfProductService
         JSONObject raw = getRaw(id);
         XfVersionProduct p = mapToProduct(raw);
         // 同步GET拿到的完整数据到Redis，这样列表FIND时也能读取
-        if (p.getProductFamily() != null && !p.getProductFamily().isEmpty()) {
-            saveMetaToRedis(p.getId(), p.getProductFamily(), p.getLifecycleStateName());
-        }
+        String ctStr = null;
+        if (p.getCreateTime() != null) ctStr = DMEUtil.dateToUTCString(p.getCreateTime());
+        saveMetaToRedis(p.getId(), p.getProductFamily(), p.getLifecycleStateName(), ctStr);
         fillFromRedis(p);
         return p;
     }
@@ -269,8 +286,13 @@ public class XfProductServiceImpl implements IXfProductService
             }
         }
 
-        String ct = raw.optString("createTime", raw.optString("lastUpdateTime", null));
-        if (ct != null && !ct.isEmpty()) {
+        // 创建时间：raw.createTime → raw.lastUpdateTime → master.createTime
+        String ct = raw.optString("createTime", null);
+        if (ct == null || ct.isEmpty() || "null".equals(ct)) ct = raw.optString("lastUpdateTime", null);
+        if ((ct == null || ct.isEmpty() || "null".equals(ct)) && master != null) {
+            ct = master.optString("createTime", master.optString("lastUpdateTime", null));
+        }
+        if (ct != null && !ct.isEmpty() && !"null".equals(ct)) {
             try { p.setCreateTime(DMEUtil.dmeDateToExamDate(ct)); } catch (Exception ignored) {}
         }
         return p;
@@ -312,7 +334,8 @@ public class XfProductServiceImpl implements IXfProductService
                 fillFromRedis(row);
                 // 如果Redis中没有元数据，尝试从GET获取（并自动缓存到Redis）
                 if ((row.getProductFamily() == null || row.getProductFamily().isEmpty())
-                        || (row.getLifecycleStateName() == null || row.getLifecycleStateName().isEmpty())) {
+                        || (row.getLifecycleStateName() == null || row.getLifecycleStateName().isEmpty())
+                        || row.getCreateTime() == null) {
                     try { autoFillMetaFromGet(row); } catch (Exception ignored) {}
                 }
                 rows.add(row);
@@ -349,8 +372,16 @@ public class XfProductServiceImpl implements IXfProductService
         params.put("createTime", DMEUtil.dateToUTCString(p.getCreateTime()));
         params.put("master", new JSONObject());
         params.put("branch", new JSONObject());
-        if (p.getLifecycleTemplate() != null) params.put("lifecycleTemplate", new JSONObject(p.getLifecycleTemplate()));
-        if (p.getLifecycleState() != null) params.put("lifecycleState", new JSONObject(p.getLifecycleState()));
+        if (p.getLifecycleTemplate() != null) {
+            params.put("lifecycleTemplate", new JSONObject(p.getLifecycleTemplate()));
+        } else if (p.getLifecycleTemplateId() != null && !p.getLifecycleTemplateId().isEmpty()) {
+            params.put("lifecycleTemplate", new JSONObject().put("id", p.getLifecycleTemplateId()));
+        }
+        if (p.getLifecycleState() != null) {
+            params.put("lifecycleState", new JSONObject(p.getLifecycleState()));
+        } else if (p.getLifecycleStateId() != null && !p.getLifecycleStateId().isEmpty()) {
+            params.put("lifecycleState", new JSONObject().put("id", p.getLifecycleStateId()));
+        }
 
         JSONObject pj = new JSONObject(); pj.put("params", params);
         JSONObject root = callDmeApi(url, pj, tap.getToken());
@@ -364,10 +395,19 @@ public class XfProductServiceImpl implements IXfProductService
             // 保存产品族和生命周期信息（FIND不返回这些字段）
             String lcName = null;
             if (p.getLifecycleState() != null) {
-                lcName = (String) p.getLifecycleState().getOrDefault("alias", p.getLifecycleState().getOrDefault("enName", ""));
+                lcName = (String) p.getLifecycleState().getOrDefault("name", p.getLifecycleState().getOrDefault("alias", ""));
             }
-            if (instanceId != null)
+            if (instanceId != null) {
+                // 通过GET获取生命周期状态名（DME create 可能不返回）
+                if (lcName == null) {
+                    try {
+                        JSONObject raw = getRaw(instanceId);
+                        JSONObject ls = raw.optJSONObject("lifecycleState");
+                        if (ls != null) lcName = ls.optString("name", ls.optString("nameEn", null));
+                    } catch (Exception ignored) {}
+                }
                 saveMetaToRedis(instanceId, p.getProductFamily(), lcName);
+            }
             return AjaxResult.success();
         }
         if (fileId != null) deleteLocalFile(fileId);

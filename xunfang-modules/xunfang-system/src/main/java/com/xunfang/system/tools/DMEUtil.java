@@ -100,10 +100,12 @@ public class DMEUtil {
         if (StringUtils.isEmpty(dmeT)) {
             return null;
         }
+        // DME 时间可能带任意毫秒值（.000 或 .520），统一处理
+        String normalized = dmeT.replaceAll("\\.\\d{3}\\+", ".000+");
         SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'.000+0000'");
         //需要GMT+8  个小时时差
         Calendar c = Calendar.getInstance();
-        c.setTime(sdf.parse(dmeT));
+        c.setTime(sdf.parse(normalized));
         c.add(Calendar.HOUR, 8);
         return c.getTime();
     }
