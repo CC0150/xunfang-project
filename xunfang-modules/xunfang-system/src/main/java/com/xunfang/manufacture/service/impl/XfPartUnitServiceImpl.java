@@ -13,10 +13,15 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+
 import javax.servlet.http.HttpServletRequest;
 import java.util.Collections;
 import java.util.List;
 
+/**
+ * 单位管理 — 服务实现
+ * DME 实体：XfPartUnit_20
+ */
 @Service
 public class XfPartUnitServiceImpl implements IXfPartUnitService
 {
@@ -69,32 +74,33 @@ public class XfPartUnitServiceImpl implements IXfPartUnitService
         TableDataInfo tab = new TableDataInfo(); tab.setCode(200); tab.setRows(rows); tab.setTotal(total); return tab;
     }
 
-    private void addCond(JSONArray conditions, String name, String value, String operator) throws Exception {
-        JSONObject c = new JSONObject(); c.put("conditionName", name);
-        JSONArray v = new JSONArray(); v.put(value);
-        c.put("conditionValues", v); c.put("ignoreStr", false); c.put("multi", false); c.put("operator", operator);
-        conditions.put(c);
-    }
-
-    @Override
-    public AjaxResult insertXfPartUnit(XfUnit xfUnit) throws Exception {
-        xfUnit.setCreateTime(DateUtils.getNowDate());
-        TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPartUnit_20/create";
-        JSONObject params = new JSONObject();
-        params.put("unitCode", xfUnit.getUnitCode());
-        params.put("unitName", xfUnit.getUnitName());
-        params.put("createTime", DMEUtil.dateToUTCString(xfUnit.getCreateTime()));
-        JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        return "SUCCESS".equals(new JSONObject(res).get("result").toString()) ? AjaxResult.success() : AjaxResult.error();
+    private void addCond(JSONArray conditions, String name, String value, String operator) {
+        try {
+            JSONObject c = new JSONObject(); c.put("conditionName", name);
+            JSONArray v = new JSONArray(); v.put(value);
+            c.put("conditionValues", v); c.put("ignoreStr", false); c.put("multi", false); c.put("operator", operator);
+            conditions.put(c);
+        } catch (org.json.JSONException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
     public AjaxResult batchInsertXfPartUnit(List<XfUnit> list) throws Exception {
         int ok = 0;
-        for (XfUnit u : list) { AjaxResult r = insertXfPartUnit(u); if (r.get("unitCode") != null && (int)r.get("unitCode") == 200) ok++; }
-        return AjaxResult.success("Success " + ok + "/" + list.size());
+        for (XfUnit u : list) {
+            u.setCreateTime(DateUtils.getNowDate());
+            TokenAndProject tap = dmeUtil.getToken();
+            String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPartUnit_20/create";
+            JSONObject params = new JSONObject();
+            params.put("unitCode", u.getUnitCode());
+            params.put("unitName", u.getUnitName());
+            params.put("createTime", DMEUtil.dateToUTCString(u.getCreateTime()));
+            JSONObject pj = new JSONObject(); pj.put("params", params);
+            String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
+            if ("SUCCESS".equals(new JSONObject(res).get("result").toString())) ok++;
+        }
+        return AjaxResult.success("成功新增 " + ok + "/" + list.size() + " 条");
     }
 
     @Override
@@ -121,15 +127,5 @@ public class XfPartUnitServiceImpl implements IXfPartUnitService
         JSONObject pj = new JSONObject(); pj.put("params", params);
         String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
         return "SUCCESS".equalsIgnoreCase(String.valueOf(new JSONObject(res).get("result"))) ? AjaxResult.success() : AjaxResult.error();
-    }
-
-    @Override
-    public AjaxResult deleteXfPartUnitById(String id) throws Exception {
-        TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPartUnit_20/delete";
-        JSONObject params = new JSONObject(); params.put("id", id);
-        JSONObject pj = new JSONObject(); pj.put("params", params);
-        String res = RequestUtil.requestsPost(url, pj.toString(), tap.getToken());
-        return "SUCCESS".equals(new JSONObject(res).get("result").toString()) ? AjaxResult.success() : AjaxResult.error();
     }
 }
