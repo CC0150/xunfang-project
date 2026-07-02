@@ -5,6 +5,7 @@ import com.xunfang.common.core.web.page.TableDataInfo;
 import com.xunfang.manufacture.domain.XfVersionProduct;
 import org.springframework.web.multipart.MultipartFile;
 import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 public interface IXfProductService {
     XfVersionProduct selectXfProductById(String id) throws Exception;
@@ -17,4 +18,6 @@ public interface IXfProductService {
     AjaxResult updateByAdmin(XfVersionProduct product) throws Exception;
     AjaxResult deleteXfProductByMasterIds(String[] masterIds) throws Exception;
     AjaxResult deleteXfProductByMasterId(String masterId) throws Exception;
+    void downloadFile(String fileId, String modelName, String instanceId,
+                      String attributeName, String filename, HttpServletResponse response) throws Exception;
 }
