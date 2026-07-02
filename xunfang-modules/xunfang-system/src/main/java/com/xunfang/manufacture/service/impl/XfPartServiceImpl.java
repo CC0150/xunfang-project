@@ -533,14 +533,28 @@ public class XfPartServiceImpl implements IXfPartService
         params.put("master", existing.optJSONObject("master") != null ? existing.getJSONObject("master") : new JSONObject());
         params.put("branch", existing.optJSONObject("branch") != null ? existing.getJSONObject("branch") : new JSONObject());
 
-        // File_20 三态
+        // extAttrs 三态
         if (newFileId != null) {
+            JSONArray value = new JSONArray();
             JSONObject fo = new JSONObject();
             fo.put("id", newFileId);
             fo.put("fileName", newFileName != null ? newFileName : "");
-            params.put("File_20", fo);
+            value.put(fo);
+            JSONObject fileAttr = new JSONObject();
+            fileAttr.put("name", "File_20");
+            fileAttr.put("type", "FILE");
+            fileAttr.put("value", value);
+            JSONArray extAttrs = new JSONArray();
+            extAttrs.put(fileAttr);
+            params.put("extAttrs", extAttrs);
         } else if (wantClear) {
-            params.put("File_20", new JSONObject());
+            JSONObject fileAttr = new JSONObject();
+            fileAttr.put("name", "File_20");
+            fileAttr.put("type", "FILE");
+            fileAttr.put("value", new JSONArray());
+            JSONArray extAttrs = new JSONArray();
+            extAttrs.put(fileAttr);
+            params.put("extAttrs", extAttrs);
         }
 
         log.info("updateXfPart params: id={}, hasFile_20={}", xfPart.getId(), params.has("File_20"));

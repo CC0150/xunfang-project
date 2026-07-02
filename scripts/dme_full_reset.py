@@ -7,7 +7,7 @@ IAM_URL = "https://iam.myhuaweicloud.com/v3/auth/tokens"
 DME_BASE = "http://7ecd0cfa-83e9-493a-b9a1-c0e4d5e80fb4.xdm.runtime.cn-north-4.huaweicloud-idme.com/rdm_5eb684ad0fcc42e0b16ff67259692e7d_app/services"
 API = DME_BASE + "/dynamic/api"
 ENTITY = "XfPart01_20"
-MODIFIER = "gzlg020 019eda0119b874869b7d13b6f0ff25c2"
+MODIFIER = "gzlg020@sxxgyrj.orgid.top 1008600001763653361"
 
 print("Auth...")
 r = requests.post(IAM_URL, json={
