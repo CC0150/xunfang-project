@@ -14,7 +14,6 @@ import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -25,9 +24,6 @@ import java.net.HttpURLConnection;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
 
 @Service
@@ -40,8 +36,6 @@ public class XfPartServiceImpl implements IXfPartService
     private RedisCache1 redisCache;
 
     /** 本地文件存储根目录（与 xunfang-file 服务共用路径） */
-    @Value("${xunfang.file.upload-dir:D:/xunfang/uploadPath}")
-    private String uploadDir;
 
     /** Redis Hash key 前缀 */
     private static final String REDIS_FILE_KEY = "manufacture:part:file";
@@ -181,38 +175,6 @@ public class XfPartServiceImpl implements IXfPartService
 
     private void deleteFileMetaFromRedis(String instanceId) {
         redisCache.hdel(REDIS_FILE_KEY, instanceId);
-    }
-
-    // ==================== 本地文件存储 ====================
-
-    private String saveFileLocally(MultipartFile file) throws Exception {
-        Path dir = Paths.get(uploadDir);
-        if (!Files.exists(dir)) Files.createDirectories(dir);
-        String fileId = UUID.randomUUID().toString().replace("-", "");
-        String originalName = file.getOriginalFilename();
-        String ext = "";
-        if (originalName != null && originalName.contains(".")) {
-            ext = originalName.substring(originalName.lastIndexOf('.'));
-        }
-        Path target = dir.resolve(fileId + ext);
-        file.transferTo(target.toFile());
-        log.info("文件已保存到本地: {}", target.toAbsolutePath());
-        return fileId;
-    }
-
-    private void deleteLocalFile(String fileId) {
-        if (fileId == null || fileId.isEmpty()) return;
-        try {
-            Path dir = Paths.get(uploadDir);
-            if (Files.exists(dir)) {
-                File[] files = dir.toFile().listFiles((d, name) -> name.startsWith(fileId));
-                if (files != null) {
-                    for (File f : files) { f.delete(); }
-                }
-            }
-        } catch (Exception e) {
-            log.warn("删除本地文件失败, fileId={}", fileId, e);
-        }
     }
 
     /**
@@ -421,19 +383,24 @@ public class XfPartServiceImpl implements IXfPartService
         xfPart.setCreateTime(DateUtils.getNowDate());
         TokenAndProject tap = dmeUtil.getToken();
 
-        // 如果有文件，保存到本地
-        String fileId = null;
+        // 1. 有文件先上传到 IDME 获取 fileId
+        String dmeFileId = null;
         String fileName = null;
         if (file != null && !file.isEmpty()) {
             try {
-                fileId = saveFileLocally(file);
+                JSONObject uploadResult = dmeUtil.uploadFile(
+                        "XfPart01_20", dmeUtil.getApplicationId(), "File_20",
+                        file, null, tap.getToken());
+                dmeFileId = DMEUtil.extractFileIdFromUploadResponse(uploadResult);
                 fileName = file.getOriginalFilename();
+                log.info("文件已上传到IDME: fileId={}, fileName={}", dmeFileId, fileName);
             } catch (Exception e) {
-                log.error("保存文件到本地失败", e);
-                return AjaxResult.error("文件保存失败: " + e.getMessage());
+                log.error("上传文件到IDME失败", e);
+                return AjaxResult.error("文件上传失败: " + e.getMessage());
             }
         }
 
+        // 2. 构建 create 请求
         String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/XfPart01_20/create";
         JSONObject params = new JSONObject();
         params.put("partName", xfPart.getPartName());
@@ -448,18 +415,37 @@ public class XfPartServiceImpl implements IXfPartService
         params.put("master", new JSONObject());
         params.put("branch", new JSONObject());
 
+        // 3. 设置 extAttrs：将文件引用写入 DME 实体（IDME 平台可见）
+        if (dmeFileId != null) {
+            JSONArray value = new JSONArray();
+            JSONObject fileObj = new JSONObject();
+            fileObj.put("id", dmeFileId);
+            fileObj.put("fileName", fileName != null ? fileName : "");
+            value.put(fileObj);
+
+            JSONObject fileAttr = new JSONObject();
+            fileAttr.put("name", "File_20");
+            fileAttr.put("type", "FILE");
+            fileAttr.put("value", value);
+
+            JSONArray extAttrs = new JSONArray();
+            extAttrs.put(fileAttr);
+            params.put("extAttrs", extAttrs);
+        }
+
         JSONObject pj = new JSONObject(); pj.put("params", params);
         JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equals(root.optString("result", ""))) {
-            // DME 创建成功后，获取 instanceId 并保存文件元数据到 Redis
+            // 4. 创建成功后，同步文件元数据到 Redis
             JSONArray dataArr = root.optJSONArray("data");
-            if (fileId != null && dataArr != null && dataArr.length() > 0) {
+            if (dmeFileId != null && dataArr != null && dataArr.length() > 0) {
                 String instanceId = dataArr.getJSONObject(0).optString("id");
-                saveFileMetaToRedis(instanceId, fileId, fileName);
+                saveFileMetaToRedis(instanceId, dmeFileId, fileName);
             }
             return AjaxResult.success();
         }
-        if (fileId != null) deleteLocalFile(fileId);
+        // 创建失败，IDME 文件会被自动回收
+        if (dmeFileId != null) log.warn("Part创建失败，IDME文件将自动回收: fileId={}", dmeFileId);
         return AjaxResult.error(root.optString("error_msg", "创建Part失败"));
     }
 
@@ -486,11 +472,16 @@ public class XfPartServiceImpl implements IXfPartService
 
         if (file != null && !file.isEmpty()) {
             try {
-                newFileId = saveFileLocally(file);
+                // 上传到 IDME 获取 fileId
+                JSONObject uploadResult = dmeUtil.uploadFile(
+                        "XfPart01_20", dmeUtil.getApplicationId(), "File_20",
+                        file, xfPart.getId(), tap.getToken());
+                newFileId = DMEUtil.extractFileIdFromUploadResponse(uploadResult);
                 newFileName = file.getOriginalFilename();
+                log.info("文件已上传到IDME: fileId={}, fileName={}", newFileId, newFileName);
             } catch (Exception e) {
-                log.error("保存文件到本地失败", e);
-                return AjaxResult.error("文件保存失败: " + e.getMessage());
+                log.error("上传文件到IDME失败", e);
+                return AjaxResult.error("文件上传失败: " + e.getMessage());
             }
         }
 
@@ -510,20 +501,45 @@ public class XfPartServiceImpl implements IXfPartService
         params.put("master", existing.optJSONObject("master") != null ? existing.getJSONObject("master") : new JSONObject());
         params.put("branch", existing.optJSONObject("branch") != null ? existing.getJSONObject("branch") : new JSONObject());
 
+        // 附件 extAttrs 三态：替换 / 删除 / 保持
+        if (newFileId != null) {
+            // A. 替换
+            JSONArray value = new JSONArray();
+            JSONObject fo = new JSONObject();
+            fo.put("id", newFileId);
+            fo.put("fileName", newFileName != null ? newFileName : "");
+            value.put(fo);
+            JSONObject fileAttr = new JSONObject();
+            fileAttr.put("name", "File_20");
+            fileAttr.put("type", "FILE");
+            fileAttr.put("value", value);
+            JSONArray extAttrs = new JSONArray();
+            extAttrs.put(fileAttr);
+            params.put("extAttrs", extAttrs);
+        } else if (wantClear) {
+            // B. 删除
+            JSONObject fileAttr = new JSONObject();
+            fileAttr.put("name", "File_20");
+            fileAttr.put("type", "FILE");
+            fileAttr.put("value", new JSONArray());
+            JSONArray extAttrs = new JSONArray();
+            extAttrs.put(fileAttr);
+            params.put("extAttrs", extAttrs);
+        }
+        // C. 保持：不传 extAttrs
+
         JSONObject pj = new JSONObject(); pj.put("params", params);
         JSONObject root = callDmeApi(url, pj, tap.getToken());
         if ("SUCCESS".equals(root.optString("result", ""))) {
             // 更新 Redis 文件元数据
             if (newFileId != null) {
                 saveFileMetaToRedis(xfPart.getId(), newFileId, newFileName);
-                if (oldFileIdToDelete != null) deleteLocalFile(oldFileIdToDelete);
             } else if (wantClear) {
                 deleteFileMetaFromRedis(xfPart.getId());
-                if (oldFileIdToDelete != null) deleteLocalFile(oldFileIdToDelete);
             }
             return AjaxResult.success();
         }
-        if (newFileId != null) deleteLocalFile(newFileId);
+        if (newFileId != null) log.warn("Part修改失败，IDME文件将自动回收: fileId={}", newFileId);
         return AjaxResult.error(root.optString("error_msg", "修改Part失败"));
     }
 
@@ -629,7 +645,8 @@ public class XfPartServiceImpl implements IXfPartService
                 JSONObject meta = getFileMetaFromRedis(instanceId);
                 if (meta != null) {
                     String oldFileId = meta.optString("fileId", null);
-                    if (oldFileId != null && !oldFileId.isEmpty()) deleteLocalFile(oldFileId);
+                    if (oldFileId != null && !oldFileId.isEmpty())
+                        log.debug("IDME文件将自动回收, fileId={}", oldFileId);
                     deleteFileMetaFromRedis(instanceId);
                 }
             }
