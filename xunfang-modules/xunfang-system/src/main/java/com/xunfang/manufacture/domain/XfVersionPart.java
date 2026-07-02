@@ -75,7 +75,7 @@ public class XfVersionPart extends XfPart
     /**
      * 从 extAttrs 提取第一个附件的文件名和下载地址
      * <p>支持 DME 返回的数组格式 [{...}] 和单对象格式 {...}
-     * <p>fileDownloadUrl 构造为：/manufacture/file/download?model_name=XfPart01&amp;instance_id={id}&amp;file_id={fileId}&amp;attribute_name=file
+     * <p>fileDownloadUrl 构造为：/manufacture/part/file/download?model_name=XfPart01_20&amp;instance_id={id}&amp;file_id={fileId}&amp;attribute_name=File_20
      */
     public void extractFileName() {
         if (extAttrs == null || extAttrs.isEmpty()) return;
@@ -110,11 +110,11 @@ public class XfVersionPart extends XfPart
             String versionId = getId();
             if (this.fileId != null && !this.fileId.isEmpty()
                     && versionId != null && !versionId.isEmpty()) {
-                this.fileDownloadUrl = "/manufacture/file/download"
-                        + "?model_name=XfPart01"
+                this.fileDownloadUrl = "/manufacture/part/file/download"
+                        + "?model_name=XfPart01_20"
                         + "&instance_id=" + versionId
                         + "&file_id=" + this.fileId
-                        + "&attribute_name=file";
+                        + "&attribute_name=File_20";
             } else {
                 // 如果有 DME fileDownloadUrl 但没有我们构造的条件，回退使用 DME 直链
                 if (fileObj.containsKey("fileDownloadUrl")) {

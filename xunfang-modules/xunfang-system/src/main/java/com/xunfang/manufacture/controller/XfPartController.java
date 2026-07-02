@@ -13,6 +13,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 @RestController
 @RequestMapping("/part")
@@ -113,6 +114,27 @@ public class XfPartController extends BaseController
         } catch (Exception e) {
             log.error("删除Part失败, id={}", id, e);
             return AjaxResult.error("删除Part失败: " + e.getMessage());
+        }
+    }
+
+    /** 文件下载代理 — 通过 IDME 流式下载 */
+    @GetMapping("/file/download")
+    public void fileDownload(
+            @RequestParam("file_id") String fileId,
+            @RequestParam(value = "model_name", defaultValue = "XfPart01_20") String modelName,
+            @RequestParam(value = "instance_id", required = false) String instanceId,
+            @RequestParam(value = "attribute_name", defaultValue = "File_20") String attributeName,
+            @RequestParam(value = "filename", required = false) String filename,
+            HttpServletResponse response) {
+        try {
+            xfPartService.downloadFile(fileId, modelName, instanceId, attributeName, filename, response);
+        } catch (Exception e) {
+            log.error("文件下载失败, fileId={}", fileId, e);
+            try {
+                response.setStatus(500);
+                response.setContentType("application/json;charset=UTF-8");
+                response.getWriter().write("{\"msg\":\"文件下载失败: " + e.getMessage() + "\"}");
+            } catch (Exception ignored) {}
         }
     }
 }

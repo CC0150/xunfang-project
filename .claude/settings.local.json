@@ -8,7 +8,26 @@
       "Bash(bash -c ' *)",
       "Read(//tmp/**)",
       "Bash(xxd /tmp/test_cn.json)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(pip list *)",
+      "Bash(python generate_doc.py)",
+      "Bash(python generate_detailed_doc.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(python analyze_docs.py)",
+      "Bash(python analyze_format.py)",
+      "Bash(python reformat_doc.py)",
+      "Bash(python verify_doc.py)",
+      "Bash(python final_fix.py)",
+      "Bash(python verify_final.py)",
+      "Bash(python last_fix.py)",
+      "Bash(python fix_color.py)",
+      "Bash(python check_tables.py)",
+      "Bash(python3 -c \"import docx; print\\('python-docx available'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python3)",
+      "Bash(PYTHONIOENCODING=utf-8 python)",
+      "Bash(python add_tables.py)",
+      "Bash(python verify_tables.py)"
     ]
   }
 }

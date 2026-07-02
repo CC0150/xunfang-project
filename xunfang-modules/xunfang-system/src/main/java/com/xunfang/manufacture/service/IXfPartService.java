@@ -5,6 +5,7 @@ import com.xunfang.common.core.web.page.TableDataInfo;
 import com.xunfang.manufacture.domain.XfVersionPart;
 import org.springframework.web.multipart.MultipartFile;
 import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 /**
  * Part 管理 服务层接口
@@ -33,4 +34,9 @@ public interface IXfPartService {
 
     /** 单个删除（按 masterId） */
     AjaxResult deleteXfPartByMasterId(String masterId) throws Exception;
+
+    /** 文件下载（流式代理 IDME） */
+    void downloadFile(String fileId, String modelName, String instanceId,
+                      String attributeName, String filename,
+                      HttpServletResponse response) throws Exception;
 }

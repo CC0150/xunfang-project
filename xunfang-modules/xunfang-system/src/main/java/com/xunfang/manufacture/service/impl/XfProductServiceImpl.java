@@ -14,15 +14,10 @@ import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.servlet.http.HttpServletRequest;
-import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
 
 @Service
@@ -33,10 +28,6 @@ public class XfProductServiceImpl implements IXfProductService
     private DMEUtil dmeUtil;
     @Autowired
     private RedisCache1 redisCache;
-
-    /** 本地文件存储根目录 */
-    @Value("${xunfang.file.upload-dir:D:/xunfang/uploadPath}")
-    private String uploadDir;
 
     private static final String ENTITY = "XfProduct_20";
     private static final String REDIS_FILE_KEY = "manufacture:product:file";
@@ -90,7 +81,7 @@ public class XfProductServiceImpl implements IXfProductService
 
     private JSONObject getRaw(String id) throws Exception {
         TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/get";
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/get";
         JSONObject p = new JSONObject(); p.put("id", id);
         JSONObject pj = new JSONObject(); pj.put("params", p);
         JSONObject root = callDmeApi(url, pj, tap.getToken());
@@ -148,31 +139,47 @@ public class XfProductServiceImpl implements IXfProductService
         redisCache.hdel(REDIS_META_KEY, instanceId);
     }
 
-    // ==================== 本地文件存储 ====================
-
-    private String saveFileLocally(MultipartFile file) throws Exception {
-        Path dir = Paths.get(uploadDir);
-        if (!Files.exists(dir)) Files.createDirectories(dir);
-        String fileId = UUID.randomUUID().toString().replace("-", "");
-        String originalName = file.getOriginalFilename();
-        String ext = "";
-        if (originalName != null && originalName.contains("."))
-            ext = originalName.substring(originalName.lastIndexOf('.'));
-        Path target = dir.resolve(fileId + ext);
-        file.transferTo(target.toFile());
-        log.info("产品文件已保存: {}", target.toAbsolutePath());
-        return fileId;
+    /** 从 DME extAttrs 中提取文件信息 */
+    private JSONObject extractFileFromExtAttrs(JSONObject raw) {
+        try {
+            JSONArray extAttrs = raw.optJSONArray("extAttrs");
+            if (extAttrs == null) return null;
+            for (int i = 0; i < extAttrs.length(); i++) {
+                JSONObject attr = extAttrs.getJSONObject(i);
+                Object valObj = attr.opt("value");
+                if (valObj instanceof JSONArray) {
+                    JSONArray values = (JSONArray) valObj;
+                    if (values.length() > 0) {
+                        JSONObject fileObj = values.getJSONObject(0);
+                        JSONObject meta = new JSONObject();
+                        meta.put("fileId", fileObj.optString("id", fileObj.optString("fileId")));
+                        meta.put("fileName", fileObj.optString("fileName", fileObj.optString("name")));
+                        return meta;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("解析extAttrs失败: {}", e.getMessage());
+        }
+        return null;
     }
 
-    private void deleteLocalFile(String fileId) {
-        if (fileId == null || fileId.isEmpty()) return;
-        try {
-            Path dir = Paths.get(uploadDir);
-            if (Files.exists(dir)) {
-                File[] files = dir.toFile().listFiles((d, name) -> name.startsWith(fileId));
-                if (files != null) for (File f : files) f.delete();
-            }
-        } catch (Exception e) { log.warn("删除本地文件失败, fileId={}", fileId, e); }
+    // ==================== IDME 文件上传 ====================
+
+    /**
+     * 上传文件到 IDME 平台并关联到实体实例，返回文件 ID
+     */
+    private String uploadFileToDme(MultipartFile file, String instanceId) throws Exception {
+        TokenAndProject tap = dmeUtil.getToken();
+        JSONObject result = dmeUtil.uploadFile(
+                ENTITY,
+                dmeUtil.getApplicationId(),
+                "File",
+                file,
+                instanceId,
+                tap.getToken()
+        );
+        return DMEUtil.extractFileIdFromUploadResponse(result);
     }
 
     /** 自动从 GET API 获取元数据并缓存到 Redis（用于弥补 FIND 不返回的字段） */
@@ -207,13 +214,19 @@ public class XfProductServiceImpl implements IXfProductService
         }
     }
 
-    /** 从 Redis 填充文件信息 + 元数据（productFamily、lifecycleStateName） */
-    private void fillFromRedis(XfVersionProduct p) {
+    /** 填充文件信息 + 元数据 — 文件优先 Redis，其次 DME extAttrs（实现双端共享） */
+    private void fillFromRedis(XfVersionProduct p, JSONObject raw) {
         String id = p.getId();
         if (id == null || id.isEmpty()) return;
 
-        // 文件信息
+        // 文件信息 — Redis 优先，其次从 DME extAttrs 提取
         JSONObject fileMeta = getFileMetaFromRedis(id);
+        if (fileMeta == null && raw != null) {
+            fileMeta = extractFileFromExtAttrs(raw);
+            if (fileMeta != null) {
+                saveFileMetaToRedis(id, fileMeta.optString("fileId"), fileMeta.optString("fileName"));
+            }
+        }
         if (fileMeta != null) {
             p.setFileId(fileMeta.optString("fileId"));
             p.setFileName(fileMeta.optString("fileName"));
@@ -221,7 +234,7 @@ public class XfProductServiceImpl implements IXfProductService
                     + "?model_name=" + ENTITY
                     + "&instance_id=" + id
                     + "&file_id=" + p.getFileId()
-                    + "&attribute_name=file");
+                    + "&attribute_name=File");
             String fn = p.getFileName();
             if (fn != null && !fn.isEmpty()) {
                 int dot = fn.lastIndexOf('.');
@@ -255,7 +268,7 @@ public class XfProductServiceImpl implements IXfProductService
         String ctStr = null;
         if (p.getCreateTime() != null) ctStr = DMEUtil.dateToUTCString(p.getCreateTime());
         saveMetaToRedis(p.getId(), p.getProductFamily(), p.getLifecycleStateName(), ctStr);
-        fillFromRedis(p);
+        fillFromRedis(p, raw);
         return p;
     }
 
@@ -302,7 +315,7 @@ public class XfProductServiceImpl implements IXfProductService
     public TableDataInfo selectXfProductList(XfVersionProduct product, HttpServletRequest request) throws Exception {
         String ps = request.getParameter("pageSize"); if (ps == null || ps.isEmpty()) ps = "10";
         String pn = request.getParameter("pageNum"); if (pn == null || pn.isEmpty()) pn = "1";
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/find/" + ps + "/" + pn;
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/find/" + ps + "/" + pn;
 
         JSONObject params = new JSONObject();
         params.put("characterSet", "UTF8"); params.put("decrypt", false);
@@ -331,7 +344,7 @@ public class XfProductServiceImpl implements IXfProductService
         if (dataArr != null) {
             for (int i = 0; i < dataArr.length(); i++) {
                 XfVersionProduct row = mapToProduct(dataArr.getJSONObject(i));
-                fillFromRedis(row);
+                fillFromRedis(row, dataArr.getJSONObject(i));
                 // 如果Redis中没有元数据，尝试从GET获取（并自动缓存到Redis）
                 if ((row.getProductFamily() == null || row.getProductFamily().isEmpty())
                         || (row.getLifecycleStateName() == null || row.getLifecycleStateName().isEmpty())
@@ -355,14 +368,8 @@ public class XfProductServiceImpl implements IXfProductService
         p.setCreateTime(DateUtils.getNowDate());
         TokenAndProject tap = dmeUtil.getToken();
 
-        // 文件保存到本地
-        String fileId = null, fileName = null;
-        if (file != null && !file.isEmpty()) {
-            try { fileId = saveFileLocally(file); fileName = file.getOriginalFilename(); }
-            catch (Exception e) { log.error("保存文件失败", e); return AjaxResult.error("文件保存失败: " + e.getMessage()); }
-        }
-
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/create";
+        // 1. 先创建 DME 实体
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/create";
         JSONObject params = new JSONObject();
         params.put("productName", p.getProductName());
         params.put("productFamily", p.getProductFamily());
@@ -385,33 +392,41 @@ public class XfProductServiceImpl implements IXfProductService
 
         JSONObject pj = new JSONObject(); pj.put("params", params);
         JSONObject root = callDmeApi(url, pj, tap.getToken());
-        if ("SUCCESS".equals(root.optString("result", ""))) {
-            // 获取新建实例的ID
-            JSONArray dataArr = root.optJSONArray("data");
-            String instanceId = (dataArr != null && dataArr.length() > 0) ? dataArr.getJSONObject(0).optString("id") : null;
-            // 保存文件+元数据到 Redis
-            if (fileId != null && instanceId != null)
-                saveFileMetaToRedis(instanceId, fileId, fileName);
-            // 保存产品族和生命周期信息（FIND不返回这些字段）
-            String lcName = null;
-            if (p.getLifecycleState() != null) {
-                lcName = (String) p.getLifecycleState().getOrDefault("name", p.getLifecycleState().getOrDefault("alias", ""));
-            }
-            if (instanceId != null) {
-                // 通过GET获取生命周期状态名（DME create 可能不返回）
-                if (lcName == null) {
-                    try {
-                        JSONObject raw = getRaw(instanceId);
-                        JSONObject ls = raw.optJSONObject("lifecycleState");
-                        if (ls != null) lcName = ls.optString("name", ls.optString("nameEn", null));
-                    } catch (Exception ignored) {}
-                }
-                saveMetaToRedis(instanceId, p.getProductFamily(), lcName);
-            }
-            return AjaxResult.success();
+        if (!"SUCCESS".equals(root.optString("result", ""))) {
+            return AjaxResult.error(root.optString("error_msg", "创建产品失败"));
         }
-        if (fileId != null) deleteLocalFile(fileId);
-        return AjaxResult.error(root.optString("error_msg", "创建产品失败"));
+
+        // 2. 获取 instanceId，有文件则上传并关联到实体
+        JSONArray dataArr = root.optJSONArray("data");
+        String instanceId = (dataArr != null && dataArr.length() > 0)
+                ? dataArr.getJSONObject(0).optString("id") : null;
+
+        // 保存产品族和生命周期信息到 Redis
+        String lcName = null;
+        if (p.getLifecycleState() != null) {
+            lcName = (String) p.getLifecycleState().getOrDefault("name", p.getLifecycleState().getOrDefault("alias", ""));
+        }
+        if (instanceId != null) {
+            if (lcName == null) {
+                try {
+                    JSONObject raw = getRaw(instanceId);
+                    JSONObject ls = raw.optJSONObject("lifecycleState");
+                    if (ls != null) lcName = ls.optString("name", ls.optString("nameEn", null));
+                } catch (Exception ignored) {}
+            }
+            saveMetaToRedis(instanceId, p.getProductFamily(), lcName);
+        }
+
+        // 3. 上传文件并关联到实体
+        if (file != null && !file.isEmpty() && instanceId != null) {
+            try {
+                String fileId = uploadFileToDme(file, instanceId);
+                saveFileMetaToRedis(instanceId, fileId, file.getOriginalFilename());
+            } catch (Exception e) {
+                log.error("上传文件到IDME失败, instanceId={}", instanceId, e);
+            }
+        }
+        return AjaxResult.success();
     }
 
     // ==================== 修改 ====================
@@ -430,11 +445,11 @@ public class XfProductServiceImpl implements IXfProductService
         if (oldMeta != null) oldFileIdToDelete = oldMeta.optString("fileId", null);
 
         if (file != null && !file.isEmpty()) {
-            try { newFileId = saveFileLocally(file); newFileName = file.getOriginalFilename(); }
-            catch (Exception e) { log.error("保存文件失败", e); return AjaxResult.error("文件保存失败: " + e.getMessage()); }
+            try { newFileId = uploadFileToDme(file, p.getId()); newFileName = file.getOriginalFilename(); }
+            catch (Exception e) { log.error("上传文件到IDME失败", e); return AjaxResult.error("文件上传失败: " + e.getMessage()); }
         }
 
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/update";
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/update";
         JSONObject params = new JSONObject();
         params.put("id", p.getId());
         params.put("productName", nvlOr(p.getProductName(), existing.optString("productName")));
@@ -443,7 +458,7 @@ public class XfProductServiceImpl implements IXfProductService
         params.put("specificationModels", nvlOr(p.getSpecificationModels(), existing.optString("specificationModels")));
         params.put("productDescribe", nvlOr(p.getProductDescribe(), existing.optString("productDescribe")));
         params.put("updateTime", DMEUtil.dateToUTCString(p.getUpdateTime()));
-        params.put("modifier", existing.optString("modifier", existing.optString("creator", "gzlg020")));
+        params.put("modifier", DMEUtil.getOperator());
         params.put("master", existing.optJSONObject("master") != null ? existing.getJSONObject("master") : new JSONObject());
         params.put("branch", existing.optJSONObject("branch") != null ? existing.getJSONObject("branch") : new JSONObject());
 
@@ -452,17 +467,17 @@ public class XfProductServiceImpl implements IXfProductService
         if ("SUCCESS".equals(root.optString("result", ""))) {
             if (newFileId != null) {
                 saveFileMetaToRedis(p.getId(), newFileId, newFileName);
-                if (oldFileIdToDelete != null) deleteLocalFile(oldFileIdToDelete);
+                if (oldFileIdToDelete != null) log.debug("旧IDME文件将自动回收, fileId={}", oldFileIdToDelete);
             } else if (wantClear) {
                 deleteFileMetaFromRedis(p.getId());
-                if (oldFileIdToDelete != null) deleteLocalFile(oldFileIdToDelete);
+                if (oldFileIdToDelete != null) log.debug("IDME文件将自动回收, fileId={}", oldFileIdToDelete);
             }
             // 更新元数据到Redis
             if (p.getProductFamily() != null && !p.getProductFamily().isEmpty())
                 saveMetaToRedis(p.getId(), p.getProductFamily(), null);
             return AjaxResult.success();
         }
-        if (newFileId != null) deleteLocalFile(newFileId);
+        if (newFileId != null) log.warn("产品修改失败，IDME文件将自动回收, fileId={}", newFileId);
         return AjaxResult.error(root.optString("error_msg", "修改产品失败"));
     }
 
@@ -471,10 +486,11 @@ public class XfProductServiceImpl implements IXfProductService
     @Override
     public AjaxResult checkOut(XfVersionProduct p) throws Exception {
         TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/checkout";
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/checkout";
         JSONObject params = new JSONObject();
         params.put("masterId", p.getMasterId());
         params.put("workCopyType", p.getWorkCopyType() != null ? p.getWorkCopyType() : "BOTH");
+        params.put("modifier", DMEUtil.getOperator());
         if (p.getLifecycleTemplate() != null) params.put("lifecycleTemplate", new JSONObject(p.getLifecycleTemplate()));
         if (p.getLifecycleState() != null) params.put("lifecycleState", new JSONObject(p.getLifecycleState()));
         JSONObject pj = new JSONObject(); pj.put("params", params);
@@ -486,10 +502,11 @@ public class XfProductServiceImpl implements IXfProductService
     @Override
     public AjaxResult checkIn(XfVersionProduct p) throws Exception {
         TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/checkin";
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/checkin";
         JSONObject params = new JSONObject();
         params.put("masterId", p.getMasterId());
         params.put("viewNo", p.getViewNo() != null ? p.getViewNo() : "");
+        params.put("modifier", DMEUtil.getOperator());
         if (p.getLifecycleTemplate() != null) params.put("lifecycleTemplate", new JSONObject(p.getLifecycleTemplate()));
         if (p.getLifecycleState() != null) params.put("lifecycleState", new JSONObject(p.getLifecycleState()));
         JSONObject pj = new JSONObject(); pj.put("params", params);
@@ -533,7 +550,7 @@ public class XfProductServiceImpl implements IXfProductService
             try { cleanupProductFileByMasterId(masterId); } catch (Exception ignored) {}
         }
         TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/batchDelete";
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/batchDelete";
         JSONArray arr = new JSONArray(); for (String id : masterIds) arr.put(id);
         JSONObject params = new JSONObject(); params.put("masterIds", arr);
         JSONObject pj = new JSONObject(); pj.put("params", params);
@@ -546,7 +563,7 @@ public class XfProductServiceImpl implements IXfProductService
     public AjaxResult deleteXfProductByMasterId(String masterId) throws Exception {
         try { cleanupProductFileByMasterId(masterId); } catch (Exception ignored) {}
         TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/delete";
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/delete";
         JSONObject params = new JSONObject(); params.put("masterId", masterId);
         JSONObject pj = new JSONObject(); pj.put("params", params);
         JSONObject root = callDmeApi(url, pj, tap.getToken());
@@ -554,10 +571,10 @@ public class XfProductServiceImpl implements IXfProductService
                 : AjaxResult.error(root.optString("error_msg", "删除失败"));
     }
 
-    /** 删除产品时清理关联的本地文件和 Redis 元数据 */
+    /** 删除产品时清理 Redis 元数据（IDME文件由平台自动回收） */
     private void cleanupProductFileByMasterId(String masterId) throws Exception {
         TokenAndProject tap = dmeUtil.getToken();
-        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + "/" + ENTITY + "/find/1/1";
+        String url = DMEUtil.projectUrl + DMEUtil.apiExecute + ENTITY + "/find/1/1";
         JSONObject params = new JSONObject();
         params.put("characterSet", "UTF8"); params.put("decrypt", false);
         params.put("isPresentAll", true); params.put("isNeedTotal", false);
@@ -578,7 +595,8 @@ public class XfProductServiceImpl implements IXfProductService
                 JSONObject meta = getFileMetaFromRedis(instanceId);
                 if (meta != null) {
                     String oldId = meta.optString("fileId", null);
-                    if (oldId != null && !oldId.isEmpty()) deleteLocalFile(oldId);
+                    if (oldId != null && !oldId.isEmpty())
+                        log.debug("IDME文件将自动回收, fileId={}", oldId);
                     deleteFileMetaFromRedis(instanceId);
                 }
                 deleteMetaFromRedis(instanceId);

@@ -19,7 +19,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.servlet.http.HttpServletRequest;
-import java.io.File;
+import javax.servlet.http.HttpServletResponse;
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -211,21 +216,37 @@ public class XfPartServiceImpl implements IXfPartService
     }
 
     /**
-     * 填充单个 Part 行数据的文件信息（从 Redis）
+     * 填充单个 Part 行数据的文件信息
+     * 优先级：Redis > DME extAttrs（实现 IDME 直传附件与本系统的双向同步）
      */
-    private void fillFileInfo(XfVersionPart row) {
+    private void fillFileInfo(XfVersionPart row, JSONObject raw) {
         String id = row.getId();
         if (id == null || id.isEmpty()) return;
         JSONObject meta = getFileMetaFromRedis(id);
+        // instanceId 未命中，尝试 masterId
+        if (meta == null && row.getMasterId() != null && !row.getMasterId().isEmpty()
+                && !row.getMasterId().equals(id)) {
+            meta = getFileMetaFromRedis(row.getMasterId());
+            if (meta != null) {
+                saveFileMetaToRedis(id, meta.optString("fileId"), meta.optString("fileName"));
+            }
+        }
+        // Redis 仍未命中，从 DME extAttrs 提取（IDME 直传的文件）
+        if (meta == null && raw != null) {
+            meta = extractFileFromExtAttrs(raw);
+            if (meta != null) {
+                saveFileMetaToRedis(id, meta.optString("fileId"), meta.optString("fileName"));
+            }
+        }
         if (meta != null) {
             row.setFileId(meta.optString("fileId"));
             row.setFileName(meta.optString("fileName"));
             // 构造下载 URL
-            row.setFileDownloadUrl("/manufacture/file/download"
-                    + "?model_name=XfPart01"
+            row.setFileDownloadUrl("/manufacture/part/file/download"
+                    + "?model_name=XfPart01_20"
                     + "&instance_id=" + id
                     + "&file_id=" + row.getFileId()
-                    + "&attribute_name=file");
+                    + "&attribute_name=File_20");
             // 提取无扩展名展示名
             String fn = row.getFileName();
             if (fn != null && !fn.isEmpty()) {
@@ -233,6 +254,31 @@ public class XfPartServiceImpl implements IXfPartService
                 row.setFileNameNoExt(dot > 0 ? fn.substring(0, dot) : fn);
             }
         }
+    }
+
+    /** 从 DME extAttrs 中提取文件信息 */
+    private JSONObject extractFileFromExtAttrs(JSONObject raw) {
+        try {
+            JSONArray extAttrs = raw.optJSONArray("extAttrs");
+            if (extAttrs == null) return null;
+            for (int i = 0; i < extAttrs.length(); i++) {
+                JSONObject attr = extAttrs.getJSONObject(i);
+                Object valObj = attr.opt("value");
+                if (valObj instanceof JSONArray) {
+                    JSONArray values = (JSONArray) valObj;
+                    if (values.length() > 0) {
+                        JSONObject fileObj = values.getJSONObject(0);
+                        JSONObject meta = new JSONObject();
+                        meta.put("fileId", fileObj.optString("id", fileObj.optString("fileId")));
+                        meta.put("fileName", fileObj.optString("fileName", fileObj.optString("name")));
+                        return meta;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("解析extAttrs失败: {}", e.getMessage());
+        }
+        return null;
     }
 
     // ==================== 查询详情 ====================
@@ -266,8 +312,8 @@ public class XfPartServiceImpl implements IXfPartService
             try { part.setCreateTime(DMEUtil.dmeDateToExamDate(ct)); } catch (Exception ignored) {}
         }
 
-        // 从 Redis 填充文件信息
-        fillFileInfo(part);
+        // 从 Redis + DME extAttrs 填充文件信息
+        fillFileInfo(part, raw);
         return part;
     }
 
@@ -347,8 +393,8 @@ public class XfPartServiceImpl implements IXfPartService
 
                 row.setUiWorkingState(normalizeWorkingState(item));
 
-                // 从 Redis 填充文件信息
-                fillFileInfo(row);
+                // 从 Redis + DME extAttrs 填充文件信息
+                fillFileInfo(row, item);
 
                 rows.add(row);
             }
@@ -588,5 +634,94 @@ public class XfPartServiceImpl implements IXfPartService
                 }
             }
         }
+    }
+
+    // ==================== 文件下载 ====================
+
+    @Override
+    public void downloadFile(String fileId, String modelName, String instanceId,
+                             String attributeName, String filename,
+                             HttpServletResponse response) throws Exception {
+        TokenAndProject tap = dmeUtil.getToken();
+        HttpURLConnection conn = dmeUtil.openDownloadConnection(
+                fileId, modelName, attributeName, instanceId,
+                dmeUtil.getApplicationId(), false, tap.getToken());
+
+        int code = conn.getResponseCode();
+        if (code == 200) {
+            String ct = conn.getContentType();
+            String cl = conn.getHeaderField("Content-Length");
+            String disp = conn.getHeaderField("Content-Disposition");
+
+            writeDownloadResponse(response, conn.getInputStream(), ct, cl, filename, disp, fileId);
+            conn.disconnect();
+            return;
+        }
+
+        if (code == 301 || code == 302) {
+            String location = conn.getHeaderField("Location");
+            conn.disconnect();
+            if (location != null) {
+                HttpURLConnection r2 = (HttpURLConnection) new java.net.URL(location).openConnection();
+                r2.setConnectTimeout(10000);
+                r2.setReadTimeout(60000);
+                r2.connect();
+                int r2Code = r2.getResponseCode();
+                if (r2Code == 200) {
+                    writeDownloadResponse(response, r2.getInputStream(),
+                            r2.getContentType(), r2.getHeaderField("Content-Length"),
+                            filename, r2.getHeaderField("Content-Disposition"), fileId);
+                } else {
+                    response.setStatus(r2Code);
+                }
+                r2.disconnect();
+                return;
+            }
+        }
+
+        response.setStatus(code);
+        conn.disconnect();
+    }
+
+    private void writeDownloadResponse(HttpServletResponse resp, InputStream body,
+                                       String ct, String cl, String queryFilename,
+                                       String cd, String fileId) throws Exception {
+        resp.setContentType(ct != null ? ct : "application/octet-stream");
+
+        // 文件名优先级：前端传参 > Content-Disposition > fileId 兜底
+        String finalName = (queryFilename != null && !queryFilename.trim().isEmpty())
+                ? URLDecoder.decode(queryFilename, "UTF-8")
+                : null;
+        if (finalName == null && cd != null) {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("filename\\*\\s*=\\s*[^']*''([^;]+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(cd);
+            if (m.find()) {
+                try { finalName = URLDecoder.decode(m.group(1).replace("\"", "").trim(), "UTF-8"); }
+                catch (Exception ignored) { finalName = m.group(1).replace("\"", "").trim(); }
+            } else {
+                m = java.util.regex.Pattern
+                        .compile("filename\\s*=\\s*\"?([^\";]+)\"?", java.util.regex.Pattern.CASE_INSENSITIVE)
+                        .matcher(cd);
+                if (m.find()) finalName = m.group(1).trim();
+            }
+        }
+        if (finalName == null || finalName.trim().isEmpty()) finalName = fileId;
+
+        String asciiName = finalName.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (asciiName.isEmpty()) asciiName = "download";
+        String encoded = URLEncoder.encode(finalName, "UTF-8").replace("+", "%20");
+        resp.setHeader("Content-Disposition",
+                "attachment; filename=\"" + asciiName + "\"; filename*=UTF-8''" + encoded);
+
+        if (cl != null) resp.setHeader("Content-Length", cl);
+        resp.setHeader("Cache-Control", "no-store");
+        resp.setHeader("Content-Transfer-Encoding", "binary");
+
+        byte[] buf = new byte[8192];
+        int n;
+        OutputStream os = resp.getOutputStream();
+        while ((n = body.read(buf)) >= 0) os.write(buf, 0, n);
+        os.flush();
     }
 }
