@@ -56,12 +56,12 @@ public class DMEUtil {
     private String dmeApplicationId;
     public String getApplicationId() { return dmeApplicationId; }
 
-    /** 操作者用户名（IAM 用户名） */
-    public static final String usingUserName = "gzlg020";
-    /** 操作者用户 ID（IAM 用户 ID） */
-    public static final String usingUserId = "019eda0119b874869b7d13b6f0ff25c2";
+    /** 操作者用户名（含 org 域） */
+    public static final String usingUserName = "gzlg020@sxxgyrj.orgid.top";
+    /** 操作者用户 ID */
+    public static final String usingUserId = "1008600001763653361";
 
-    /** DME 操作者标识（格式: username userId，与 DME 实体存储格式一致） */
+    /** DME 操作者标识 */
     public static String getOperator() {
         return usingUserName + " " + usingUserId;
     }
@@ -189,14 +189,16 @@ public class DMEUtil {
         String originalName = file.getOriginalFilename();
         if (originalName == null) originalName = "file";
 
-        // 构建 URL（所有参数在 Query 中）
+        // 构建 URL
         StringBuilder urlBuilder = new StringBuilder(projectUrl)
                 .append(API_UPLOAD_FILE)
                 .append("?modelName=").append(URLEncoder.encode(modelName, "UTF-8"))
                 .append("&attributeName=").append(URLEncoder.encode(attributeName, "UTF-8"))
                 .append("&applicationId=").append(URLEncoder.encode(applicationId, "UTF-8"))
                 .append("&modelNumber=").append(URLEncoder.encode(modelName, "UTF-8"))
-                .append("&encrypted=true")
+                .append("&username=").append(URLEncoder.encode(usingUserName + " " + usingUserId, "UTF-8"))
+                .append("&encrypted=false")
+                .append("&storageType=0")
                 .append("&autoResolution=true")
                 .append("&exaAttr=1");
         if (instanceId != null && !instanceId.isEmpty()) {
@@ -209,25 +211,33 @@ public class DMEUtil {
         conn.setRequestMethod("POST");
         conn.setRequestProperty("X-Auth-Token", token);
         conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+        conn.setRequestProperty("modifier", getOperator());
+        conn.setRequestProperty("tenantId", "-1");
+        conn.setRequestProperty("applicationId", dmeApplicationId);
+        conn.setRequestProperty("X-Dme-Timezone", "UTC+08:00");
         conn.setConnectTimeout(30000);
         conn.setReadTimeout(120000);
 
-        // 写入 multipart body
-        try (OutputStream os = conn.getOutputStream();
-             PrintWriter writer = new PrintWriter(new OutputStreamWriter(os, "UTF-8"), true)) {
+        // 写入 multipart body（纯 OutputStream，避免 PrintWriter 混用导致二进制损坏）
+        try (OutputStream os = conn.getOutputStream()) {
+            String lineEnd = "\r\n";
+            String twoHyphens = "--";
 
-            writer.append("--").append(boundary).append("\r\n");
-            writer.append("Content-Disposition: form-data; name=\"files\"; filename=\"")
-                  .append(originalName).append("\"\r\n");
-            writer.append("Content-Type: ").append(file.getContentType() != null
-                  ? file.getContentType() : "application/octet-stream").append("\r\n");
-            writer.append("\r\n");
-            writer.flush();
+            // part header
+            os.write((twoHyphens + boundary + lineEnd).getBytes("UTF-8"));
+            os.write(("Content-Disposition: form-data; name=\"files\"; filename=\""
+                    + originalName + "\"" + lineEnd).getBytes("UTF-8"));
+            os.write(("Content-Type: " + (file.getContentType() != null
+                    ? file.getContentType() : "application/octet-stream") + lineEnd).getBytes("UTF-8"));
+            os.write(lineEnd.getBytes("UTF-8"));
+
+            // file binary
             os.write(file.getBytes());
+            os.write(lineEnd.getBytes("UTF-8"));
+
+            // end boundary
+            os.write((twoHyphens + boundary + twoHyphens + lineEnd).getBytes("UTF-8"));
             os.flush();
-            writer.append("\r\n");
-            writer.append("--").append(boundary).append("--\r\n");
-            writer.flush();
         }
 
         // 读取响应
@@ -259,7 +269,7 @@ public class DMEUtil {
         if (!"SUCCESS".equals(result.optString("result", ""))) {
             throw new RuntimeException("DME文件上传失败: " + responseBody);
         }
-        logger.info("DME文件上传成功, modelName={}, fileName={}", modelName, originalName);
+        logger.info("DME文件上传成功, modelName={}, fileName={}, response={}", modelName, originalName, responseBody);
         return result;
     }
 
@@ -288,6 +298,7 @@ public class DMEUtil {
                 .append("&application_id=").append(URLEncoder.encode(applicationId, "UTF-8"))
                 .append("&is_master_attr=0")
                 .append("&attribute_name=").append(URLEncoder.encode(attributeName, "UTF-8"))
+                .append("&decrypt=true")
                 .append("&download_type=DIRECT_LINK")
                 .append("&tenant_id=-1");
 
